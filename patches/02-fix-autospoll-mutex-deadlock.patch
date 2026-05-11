@@ -1,0 +1,25 @@
+--- a/drivers/gpib/common/iblib.c	2025-09-28 06:26:24.000000000 +1300
++++ b/drivers/gpib/common/iblib.c	2026-04-24 19:28:46.020744726 +1200
+@@ -152,12 +152,19 @@
+ {
+ 	int retval;
+ 
+-	mutex_lock(&board->big_gpib_mutex);
+-
++	/* Use trylock to avoid ABBA deadlock vs iboffline()/kthread_stop():
++	 * iboffline() is called with big_gpib_mutex held and calls
++	 * kthread_stop() on this thread. If we block on mutex_lock()
++	 * here, we never exit, and kthread_stop() waits forever.
++	 * Returning 0 on contention is safe: the thread re-sleeps and
++	 * is re-awoken by the next board->wait wakeup, or by
++	 * kthread_stop() itself via wake_up_process() — at which point
++	 * kthread_should_stop() short-circuits this entire function. */
++	if (!mutex_trylock(&board->big_gpib_mutex))
++		return 0;
+ 	retval = board->master && board->autospollers > 0 &&
+ 		!atomic_read(&board->stuck_srq) &&
+ 		test_and_clear_bit(SRQI_NUM, &board->status);
+-
+ 	mutex_unlock(&board->big_gpib_mutex);
+ 	return retval;
+ }

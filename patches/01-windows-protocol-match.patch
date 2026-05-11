@@ -1,0 +1,335 @@
+--- a/drivers/gpib/agilent_82357a/agilent_82357a.c
++++ b/drivers/gpib/agilent_82357a/agilent_82357a.c
+@@ -448,9 +448,22 @@
+ 	if (!out_data)
+ 		return -ENOMEM;
+ 	out_data[i++] = DATA_PIPE_CMD_READ;
+-	out_data[i++] = 0;	// primary address when ARF_NO_ADDR is not set
+-	out_data[i++] = 0;	// secondary address when ARF_NO_ADDR is not set
+-	out_data[i] = ARF_NO_ADDRESS | ARF_END_ON_EOI;
++	/*
++	 * DATA_PIPE_CMD_READ: mirror the DATA_WRITE fix from
++	 * generic_write() — put the target PAD in byte 1 and clear
++	 * ARF_NO_ADDRESS so the firmware auto-addresses the talker
++	 * for this transfer. Without this, the firmware never
++	 * actually pulls bytes off the bus on this firmware variant
++	 * (same root cause as the data-write path). target_pad was
++	 * scraped from the preceding agilent_82357a_command()
++	 * invocation's TAD byte. Secondary-address byte is 0xff
++	 * ("no SAD") rather than 0x00 ("SAD 0"), again matching
++	 * Windows — the field isn't fully ignored even when
++	 * ARF_NO_ADDRESS is set, so keep 0xff for safety.
++	 */
++	out_data[i++] = a_priv->target_pad;
++	out_data[i++] = a_priv->target_sad ? a_priv->target_sad : 0xff;
++	out_data[i] = ARF_END_ON_EOI;
+ 	if (a_priv->eos_mode & REOS)
+ 		out_data[i] |= ARF_END_ON_EOS_CHAR;
+ 	++i;
+@@ -562,14 +575,39 @@
+ 	if (!out_data)
+ 		return -ENOMEM;
+ 	out_data[i++] = DATA_PIPE_CMD_WRITE;
+-	out_data[i++] = 0; // primary address when AWF_NO_ADDRESS is not set
+-	out_data[i++] = 0; // secondary address when AWF_NO_ADDRESS is not set
+-	out_data[i] = AWF_NO_ADDRESS | AWF_NO_FAST_TALKER_FIRST_BYTE;
+-	if (send_commands)
+-		out_data[i] |= AWF_ATN | AWF_NO_FAST_TALKER;
+-	if (send_eoi)
+-		out_data[i] |= AWF_SEND_EOI;
+-	++i;
++	if (send_commands) {
++		/*
++		 * Command-byte writes: Windows uses flag byte 0x1c
++		 * (NO_ADDRESS | NO_FAST_TALKER | ATN). AWF_NO_ADDRESS
++		 * is set so pad/sad are nominally ignored, but the sad
++		 * field isn't fully ignored on this firmware — 0x00
++		 * makes it try to issue MSA 0; match Windows with 0xff.
++		 */
++		out_data[i++] = 0x00;
++		out_data[i++] = 0xff;
++		out_data[i] = AWF_NO_ADDRESS | AWF_NO_FAST_TALKER | AWF_ATN;
++		if (send_eoi)
++			out_data[i] |= AWF_SEND_EOI;
++		++i;
++	} else {
++		/*
++		 * Data-byte writes: Windows uses flag byte 0x03
++		 * (NO_FAST_TALKER_FIRST_BYTE | [EOI]) with
++		 * AWF_NO_ADDRESS CLEAR and the TARGET PAD in byte 1.
++		 * The firmware then does its own UNL/LAD/MTA/GTS
++		 * dance for the transfer. If we leave AWF_NO_ADDRESS
++		 * set and rely on earlier command-byte addressing,
++		 * the firmware never drives data onto the bus and no
++		 * write-complete interrupt arrives. target_pad is
++		 * the most recent LAD from agilent_82357a_command().
++		 */
++		out_data[i++] = a_priv->target_pad;
++		out_data[i++] = a_priv->target_sad ? a_priv->target_sad : 0xff;
++		out_data[i] = AWF_NO_FAST_TALKER_FIRST_BYTE;
++		if (send_eoi)
++			out_data[i] |= AWF_SEND_EOI;
++		++i;
++	}
+ 	out_data[i++] = length & 0xff;
+ 	out_data[i++] = (length >> 8) & 0xff;
+ 	out_data[i++] = (length >> 16) & 0xff;
+@@ -651,28 +689,19 @@
+ 		return -ETIMEDOUT;
+ 	}
+ 
+-	status_data = kmalloc(STATUS_DATA_LEN, GFP_KERNEL);
+-	if (!status_data) {
+-		mutex_unlock(&a_priv->bulk_transfer_lock);
+-		return -ENOMEM;
+-	}
+-
+-	retval = agilent_82357a_receive_control_msg(a_priv, agilent_82357a_control_request,
+-					    USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
+-					    XFER_STATUS, 0, status_data, STATUS_DATA_LEN,
+-					    100);
+ 	mutex_unlock(&a_priv->bulk_transfer_lock);
+-	if (retval < 0)	{
+-		dev_err(&usb_dev->dev, "receive_control_msg() returned %i\n", retval);
+-		kfree(status_data);
+-		return -EIO;
+-	}
+-	*bytes_written	= (u32)status_data[2];
+-	*bytes_written |= (u32)status_data[3] << 8;
+-	*bytes_written |= (u32)status_data[4] << 16;
+-	*bytes_written |= (u32)status_data[5] << 24;
+-
+-	kfree(status_data);
++	/*
++	 * Skip the XFER_STATUS EP0 vendor request entirely. The
++	 * Keysight Windows driver never sends it; this firmware
++	 * variant doesn't implement it either so the call always
++	 * times out after 100 ms. The bulk-OUT byte count we already
++	 * got from send_bulk_msg() plus the EP 0x88 write-complete
++	 * interrupt we waited on above are the success signals; report
++	 * length-bytes-written and return 0.
++	 */
++	*bytes_written = length;
+ 	return 0;
+ }
+ 
+@@ -685,6 +714,67 @@
+ int agilent_82357a_command(struct gpib_board *board, u8 *buffer, size_t length,
+ 			   size_t *bytes_written)
+ {
++	struct agilent_82357a_priv *a_priv = board->private_data;
++	size_t j;
++
++	/*
++	 * Peek at the command-byte stream for addressing commands
++	 * and remember the most recent "other side" of the
++	 * transfer. Windows's protocol for data writes/reads puts
++	 * the target PAD in byte 1 of the bulk-OUT header and lets
++	 * the firmware auto-address; we need to recover the PAD
++	 * from here since gpib_common doesn't pass it to the
++	 * driver write()/read() hooks.
++	 */
++	a_priv->target_sad = 0xff;
++	for (j = 0; j < length; j++) {
++		u8 b = buffer[j];
++		if (b == 0x3f || b == 0x5f)
++			continue;
++		if (b >= 0x20 && b <= 0x3e) {
++			unsigned pad = b - 0x20;
++			if (pad != board->pad)
++				a_priv->target_pad = pad;
++		} else if (b >= 0x40 && b <= 0x5e) {
++			unsigned pad = b - 0x40;
++			if (pad != board->pad)
++				a_priv->target_pad = pad;
++		} else if (b >= 0x60 && b <= 0x7e) {
++			a_priv->target_sad = b;
++		}
++	}
++
++	return agilent_82357a_generic_write(board, buffer, length, 1, 0, bytes_written);
++}
++
+@@ -1222,66 +1321,103 @@
+ 	int retval;
+ 	unsigned int nanosec;
+ 
+-	writes[0].address = LED_CONTROL;
+-	writes[0].value = FAIL_LED_ON;
+-	writes[1].address = RESET_TO_POWERUP;
+-	writes[1].value = RESET_SPACEBALL;
+-	retval = agilent_82357a_write_registers(a_priv, writes, 2);
++	/*
++	 * Replay the Keysight Windows driver's exact init sequence.
++	 */
++	{
++		struct agilent_82357a_register_pairlet rd;
++		rd.address = 0x09;
++		retval = agilent_82357a_read_registers(a_priv, &rd, 1, 1);
++		if (retval) {
++			dev_err(&usb_dev->dev, "init: probe RD_REGS(9) failed\n");
++			return -EIO;
++		}
++	}
++
++	writes[0].address = RESET_TO_POWERUP;
++	writes[0].value = RESET_SPACEBALL;
++	retval = agilent_82357a_write_registers(a_priv, writes, 1);
+ 	if (retval) {
+-		dev_err(&usb_dev->dev, "write_registers() returned error\n");
++		dev_err(&usb_dev->dev, "init: RESET_TO_POWERUP failed\n");
+ 		return -EIO;
+ 	}
+ 	set_current_state(TASK_INTERRUPTIBLE);
+ 	if (schedule_timeout(usec_to_jiffies(2000)))
+ 		return -ERESTARTSYS;
+-	writes[0].address = AUXCR;
+-	writes[0].value = AUX_NBAF;
+-	writes[1].address = AUXCR;
+-	writes[1].value = AUX_HLDE;
+-	writes[2].address = AUXCR;
+-	writes[2].value = AUX_TON;
+-	writes[3].address = AUXCR;
+-	writes[3].value = AUX_LON;
+-	writes[4].address = AUXCR;
+-	writes[4].value = AUX_RSV2;
+-	writes[5].address = AUXCR;
+-	writes[5].value = AUX_INVAL;
+-	writes[6].address = AUXCR;
+-	writes[6].value = AUX_RPP;
+-	writes[7].address = AUXCR;
+-	writes[7].value = AUX_STDL;
+-	writes[8].address = AUXCR;
+-	writes[8].value = AUX_VSTDL;
+-	writes[9].address = FAST_TALKER_T1;
++	writes[0].address  = HW_CONTROL;      writes[0].value  = 0x07;
++	writes[1].address  = LED_CONTROL;     writes[1].value  = FIRMWARE_LED_CONTROL;
++	writes[2].address  = AUXCR;           writes[2].value  = 0x80;
++	writes[3].address  = 0x00;            writes[3].value  = 0x10;
++	writes[4].address  = 0x01;            writes[4].value  = 0x02;
++	writes[5].address  = AUXCR;           writes[5].value  = 0x05;
++	writes[6].address  = AUXCR;           writes[6].value  = 0x04;
++	writes[7].address  = 0x04;            writes[7].value  = 0x15;
++	writes[8].address  = SPMR;            writes[8].value  = 0x00;
++	writes[9].address  = AUXCR;           writes[9].value  = 0x95;
++	writes[10].address = AUXCR;           writes[10].value = 0x09;
++	writes[11].address = AUXCR;           writes[11].value = 0x0a;
++	writes[12].address = PPR;             writes[12].value = 0x00;
++	writes[13].address = AUXCR;           writes[13].value = 0x18;
++	writes[14].address = AUXCR;           writes[14].value = 0x20;
++	writes[15].address = AUXCR;           writes[15].value = 0x01;
++	writes[16].address = AUXCR;           writes[16].value = 0x00;
++	writes[17].address = AUXCR;           writes[17].value = 0x0c;
++	retval = agilent_82357a_write_registers(a_priv, writes, 18);
++	if (retval) {
++		dev_err(&usb_dev->dev, "init: main batch failed\n");
++		return -EIO;
++	}
++
++	writes[0].address = AUXCR;            writes[0].value = 0x8f;
++	writes[1].address = AUXCR;            writes[1].value = 0x90;
++	writes[2].address = AUXCR;            writes[2].value = 0x0e;
++	writes[3].address = AUXCR;            writes[3].value = 0x0f;
++	writes[4].address = 0x09;             writes[4].value = 0x03;
++	writes[5].address = PROTOCOL_CONTROL; writes[5].value = WRITE_COMPLETE_INTERRUPT_EN;
++	retval = agilent_82357a_write_registers(a_priv, writes, 6);
++	if (retval) {
++		dev_err(&usb_dev->dev, "init: trailer batch failed\n");
++		return -EIO;
++	}
++
++	writes[0].address = FAST_TALKER_T1;
+ 	nanosec = board->t1_nano_sec;
+-	writes[9].value = nanosec_to_fast_talker_bits(&nanosec);
++	writes[0].value = nanosec_to_fast_talker_bits(&nanosec);
+ 	board->t1_nano_sec = nanosec;
+-	writes[10].address = ADR;
+-	writes[10].value = board->pad & ADDRESS_MASK;
+-	writes[11].address = PPR;
+-	writes[11].value = 0;
+-	writes[12].address = SPMR;
+-	writes[12].value = 0;
+-	writes[13].address = PROTOCOL_CONTROL;
+-	writes[13].value = WRITE_COMPLETE_INTERRUPT_EN;
+-	writes[14].address = IMR0;
+-	writes[14].value = HR_BOIE | HR_BIIE;
+-	writes[15].address = IMR1;
+-	writes[15].value = HR_SRQIE;
+-	writes[16].address = AUXCR;
+-	writes[16].value = AUX_CHIP_RESET;
+-	writes[17].address = LED_CONTROL;
+-	writes[17].value = FIRMWARE_LED_CONTROL;
+-	retval = agilent_82357a_write_registers(a_priv, writes, INIT_NUM_REG_WRITES);
++	retval = agilent_82357a_write_registers(a_priv, writes, 1);
+ 	if (retval) {
+-		dev_err(&usb_dev->dev, "write_registers() returned error\n");
++		dev_err(&usb_dev->dev, "init: FAST_TALKER_T1 failed\n");
+ 		return -EIO;
+ 	}
+ 	hw_control.address = HW_CONTROL;
+@@ -1352,6 +1488,20 @@
+ 		goto attach_fail;
+ 	}
+ 
++	/*
++	 * Clear ENDPOINT_HALT on the three 82357B endpoints.
++	 */
++	usb_clear_halt(usb_dev,
++		       usb_rcvbulkpipe(usb_dev, AGILENT_82357_BULK_IN_ENDPOINT));
++	usb_clear_halt(usb_dev,
++		       usb_sndbulkpipe(usb_dev, a_priv->bulk_out_endpoint));
++	usb_clear_halt(usb_dev,
++		       usb_rcvintpipe(usb_dev, a_priv->interrupt_in_endpoint));
++
+ 	retval = agilent_82357a_setup_urbs(board);
+ 	if (retval < 0)
+ 		goto attach_fail;
+@@ -1360,6 +1510,7 @@
+ 
+ 	board->t1_nano_sec = 800;
++	(void)agilent_82357a_abort(a_priv, 0);
+ 
+ 	retval = agilent_82357a_init(board);
+ 
+@@ -1606,8 +1767,19 @@
+ 		goto resume_exit;
+ 	}
+ 	a_priv = board->private_data;
+-	
++
+ 	if (a_priv) {
++		usb_clear_halt(usb_dev,
++			       usb_rcvbulkpipe(usb_dev, AGILENT_82357_BULK_IN_ENDPOINT));
++		usb_clear_halt(usb_dev,
++			       usb_sndbulkpipe(usb_dev, a_priv->bulk_out_endpoint));
++		usb_clear_halt(usb_dev,
++			       usb_rcvintpipe(usb_dev, a_priv->interrupt_in_endpoint));
++
+ 		if (a_priv->interrupt_urb) {
+ 			mutex_lock(&a_priv->interrupt_alloc_lock);
+ 			retval = usb_submit_urb(a_priv->interrupt_urb, GFP_KERNEL);
+@@ -1620,6 +1792,7 @@
+ 			}
+ 			mutex_unlock(&a_priv->interrupt_alloc_lock);
+ 		}
++		(void)agilent_82357a_abort(a_priv, 0);
+ 		retval = agilent_82357a_init(board);
+ 		if (retval < 0) {
+ 			mutex_unlock(&agilent_82357a_hotplug_lock);
+--- a/drivers/gpib/agilent_82357a/agilent_82357a.h
++++ b/drivers/gpib/agilent_82357a/agilent_82357a.h
+@@ -139,6 +139,16 @@
+ 	unsigned int interrupt_in_endpoint;
+ 	unsigned is_cic : 1;
+ 	unsigned ren_state : 1;
++	/*
++	 * Most-recently-addressed target PAD/SAD, scraped from the
++	 * command() byte stream. Used in generic_write()/read() to
++	 * populate the bulk-OUT header's addressing fields so the
++	 * firmware can do its own auto-addressing for data transfers.
++	 */
++	u8 target_pad;
++	u8 target_sad;
+ };
+ 
+ struct agilent_82357a_register_pairlet {
