@@ -1,0 +1,34 @@
+[Unit]
+Description=GPIB-over-Ethernet bridge for Keysight 82357B (Prologix-compatible)
+Documentation=https://github.com/czjtel/82357b-linux-gpib
+Documentation=man:gpib_config(8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStartPre=/usr/local/bin/gpib_cold_init --no-rebind
+ExecStartPre=/sbin/modprobe agilent_82357a
+ExecStartPre=-/usr/local/sbin/gpib_config --minor 0
+ExecStart=/usr/local/bin/gpib_server --bind 0.0.0.0 --port 1234 --board 0
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/run /var/log
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

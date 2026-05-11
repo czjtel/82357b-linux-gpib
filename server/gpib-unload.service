@@ -1,0 +1,9 @@
+[Unit]
+Description=Unload agilent_82357a after 82357B disconnect
+Conflicts=gpib-hotplug.service
+
+[Service]
+Type=oneshot
+ExecStart=-/bin/systemctl stop gpib-server.service
+ExecStart=-/sbin/modprobe -r agilent_82357a
+RemainAfterExit=no

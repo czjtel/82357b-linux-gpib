@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / generated artifacts
+build/
+dist/
+*.o
+*.so
+*.a
+*.log
+*.tmp
+*.swp
+*~
+
+# Firmware / downloaded artifacts
+firmware/stock/downloaded/
+firmware/diag/build/
+
+# Packet captures / reverse-engineering artifacts
+*.pcap
+*.pcapng
+*.cap
+vendor-windows/
+82357B-setup.exe
+docs/disasm/
+
+# OS files
+.DS_Store
+Thumbs.db

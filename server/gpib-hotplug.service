@@ -1,0 +1,15 @@
+[Unit]
+Description=82357B hotplug handler — recover firmware + kick gpib-server
+StartLimitIntervalSec=30
+StartLimitBurst=10
+
+[Service]
+Type=oneshot
+ExecStart=-/bin/systemctl stop gpib-server.service
+ExecStart=-/sbin/modprobe -r agilent_82357a
+ExecStart=-/bin/sleep 1
+ExecStart=/usr/local/bin/gpib_cold_init --no-rebind
+ExecStart=/sbin/modprobe agilent_82357a
+ExecStart=-/usr/local/sbin/gpib_config --minor 0
+ExecStart=-/bin/systemctl start gpib-server.service
+RemainAfterExit=no

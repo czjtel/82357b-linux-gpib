@@ -1,0 +1,20 @@
+# Auto-upload stock Keysight firmware to the 82357B on hotplug.
+#
+# The 82357B comes out of reset as 0957:0518 (no firmware); fxload uploads
+# measat_releaseX1.8.hex to SRAM, the device re-enumerates as 0957:0718,
+# and the linux-gpib kernel driver (agilent_82357a) can then bind to it.
+
+ACTION=="add", SUBSYSTEM=="usb", ENV{ID_VENDOR_ID}=="0957", ENV{ID_MODEL_ID}=="0518", \
+    RUN+="/usr/sbin/fxload -t fx2lp -D $env{DEVNAME} -I /lib/firmware/agilent_82357a/measat_releaseX1.8.hex"
+
+# Trigger firmware recovery + server restart on every hotplug (0x0718).
+# The 82357B firmware lands in a power-on fault state at every cold
+# enumeration; gpib-hotplug.service runs gpib_cold_init to recover it,
+# then restarts the gpib-server so it re-opens /dev/gpib0.
+ACTION=="add", SUBSYSTEM=="usb", ENV{PRODUCT}=="957/718/0", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}="gpib-hotplug.service"
+
+# On disconnect, unload the kernel driver so the next plug-in does not
+# auto-bind it before the userspace recovery path can run.
+ACTION=="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{PRODUCT}=="957/718/0", \
+    RUN+="/bin/systemctl --no-block start gpib-unload.service"

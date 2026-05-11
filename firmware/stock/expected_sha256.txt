@@ -1,0 +1,4 @@
+# sha256 of agilent_82357a/measat_releaseX1.8.hex from fmhess/linux_gpib_firmware.
+# Pinning this lets future installs verify integrity. Update if you intentionally
+# move to a new upstream build.
+2c40213a3d0d8b7d7cc083b155a5ed094e29767214a9b8aa745486f35ef58664  measat_releaseX1.8.hex
