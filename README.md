@@ -1,127 +1,55 @@
-# 82357B Linux GPIB
+# Keysight 82357B on modern Linux with patched linux-gpib
 
-Linux install script, driver patches, firmware setup, and tools for the Keysight/Agilent 82357B USB-to-GPIB adapter, with optional GPIB server support.
+This repo contains the files needed to use a **Keysight/Agilent 82357B USB-GPIB adapter** on modern Linux systems with a patched `linux-gpib` build.
 
-![Verified working result](docs/assets/working_setup.png)
+It includes:
 
-This image shows the tested system working after applying the patch in this repository.
+- an install script for dependencies, driver build, firmware, and udev setup
+- two patch files for `linux-gpib`
+- Python utilities for scanning the GPIB bus
+- an optional Prologix-compatible GPIB-over-Ethernet server
 
-## Background
+![Working setup](docs/assets/working_setup.png)
 
-This project started because I wanted to use an 82357B USB-GPIB adapter on Linux for long-running use.
+## Status
 
-The adapter worked well on Windows with Keysight IO Libraries, but Windows was not a good fit for a system that needed to stay running all the time. I tried many times to get the adapter working on Linux, both on an x86 PC and on a Raspberry Pi 5, using different guides and information from the web. But it always failed. The adapter would appear on USB, but the LEDs stayed in a bad state and no GPIB communication worked.
+This is intended for systems where stock `linux-gpib` packaging or older DKMS builds do not work reliably with newer kernels.
 
-At first, it looked like Linux might be loading the wrong firmware. After USB debugging, it turned out the firmware matched what Windows was using. The real issue was in the Linux driver behavior.
+Tested on:
+- Ubuntu 25.10
+- Raspberry Pi 5
+- aarch64
+- kernel 6.17
 
-Debugging that problem was slow, but later AI tools helped speed up the work by comparing traces, checking behavior, and helping create the code and patches in this repository. That work led to the patch here, along with `install.sh` and an optional GPIB server setup.
+Your exact distro/kernel may vary, but the repo is structured to make the setup reproducible.
 
-The result is a working Linux setup on my tested systems, where GPIB devices can be scanned and used normally.
+## Quick install
 
-A large part of the code in this repository was created or improved with AI help. If you find a bug or need an improvement, you can also use AI to help study the problem, create a fix, and contribute it back. Hopefully this project can keep growing and help more people in the electronics engineering community.
-
-## Why this patch is needed
-
-On the tested Linux systems, the normal Linux initialization path did not bring this 82357B firmware variant into a working GPIB state. The adapter could be detected by USB, but it stayed in a failed state and could not do normal GPIB communication.
-
-The patch in this repository changes the driver behavior so the adapter can initialize correctly and work reliably.
-
-## What this repository provides
-
-- Linux install script
-- patched `linux-gpib` build flow
-- udev rules for device handling
-- firmware fetch and install flow
-- GPIB scan tools
-- optional TCP GPIB server
-
-## Quick start
-
-```bash
-git clone https://github.com/czjtel/82357b-linux-gpib.git
-cd 82357b-linux-gpib
-sudo ./install.sh
-```
-
-Then unplug and replug the adapter, and test it with:
-
-```bash
-sudo modprobe agilent_82357a
-sudo gpib_config --minor 0
-python3 tools/gpib_scan.py
-```
-
-## `install.sh` options
-
-Run with:
-
-```bash
-sudo ./install.sh [options]
-```
-
-Available options:
-
-- `--with-diag`  
-  Also build the diagnostic firmware in `firmware/diag/`. This is used for GPIO and LED checking.
-
-- `--with-server`  
-  Install and enable the optional GPIB-over-Ethernet server in `server/`. This provides a Prologix-compatible TCP server on port `1234`.
-
-- `--no-fetch`  
-  Skip downloading the stock firmware. Use this only if the required firmware file is already present locally.
-
-- `-h`, `--help`  
-  Show the built-in help message.
-
-## What `install.sh` does
-
-The script is designed to be rerun safely. It does the following:
-
-1. installs required packages with `apt`
-2. downloads and builds `linux-gpib` from source
-3. applies the patches from `patches/`
-4. builds and installs the Python GPIB bindings
-5. updates `/etc/gpib.conf` so board `minor=0` uses `agilent_82357a`
-6. fetches and installs the stock firmware
-7. installs the udev rules
-8. optionally builds diagnostic firmware
-9. optionally installs and enables the TCP GPIB server
-
-## Example commands
-
-Basic install:
+Clone the repo and run:
 
 ```bash
 sudo ./install.sh
 ```
 
-Install with diagnostic firmware build:
-
-```bash
-sudo ./install.sh --with-diag
-```
-
-Install with TCP GPIB server:
+To also install the TCP server:
 
 ```bash
 sudo ./install.sh --with-server
 ```
 
-Install without downloading firmware again:
+The installer will:
 
-```bash
-sudo ./install.sh --no-fetch
-```
+1. install required packages
+2. build `linux-gpib` from source
+3. apply the patches in `patches/`
+4. install Python bindings
+5. fix `/etc/gpib.conf` for the 82357B
+6. fetch and install stock firmware
+7. install the required udev rule
 
-Install with both diagnostic firmware and server support:
+## Verify the adapter
 
-```bash
-sudo ./install.sh --with-diag --with-server
-```
-
-## After installation
-
-Typical next steps:
+After install, plug in or replug the adapter, then run:
 
 ```bash
 sudo modprobe agilent_82357a
@@ -129,7 +57,22 @@ sudo gpib_config --minor 0
 sudo python3 tools/gpib_scan.py
 ```
 
-If server mode was installed, you can test it from another host with:
+Expected result:
+- the adapter enumerates correctly
+- the READY LED goes solid green
+- connected instruments respond on the bus
+
+## Optional GPIB-over-Ethernet server
+
+This repo also includes a simple Prologix-compatible server:
+
+- `server/gpib_server.py`
+- `server/gpib_cold_init.py`
+- systemd unit files in `server/`
+
+If installed with `--with-server`, it listens on port `1234` by default.
+
+Example test from another machine:
 
 ```bash
 nc <host-ip> 1234
@@ -139,18 +82,28 @@ nc <host-ip> 1234
 ++read
 ```
 
+To follow logs:
+
+```bash
+journalctl -u gpib-server -f
+```
+
+## Repo layout
+
+- `install.sh` — main installer
+- `patches/` — `linux-gpib` patches used by the installer
+- `firmware/stock/` — stock firmware fetch helper and expected hash
+- `udev/` — udev and modprobe config
+- `tools/` — GPIB scan utilities
+- `server/` — optional TCP bridge and systemd units
+- `docs/assets/` — screenshots and images
+
 ## Notes
 
-- This project does not include Keysight proprietary firmware blobs in the repository.
-- Firmware is loaded into RAM only. EEPROM is not changed.
-- This is an independent project and is not affiliated with or endorsed by Keysight Technologies.
-
-## Contributing
-
-If you improve it or make it work on more Linux systems, contributions are welcome.
-
-If you hit a problem, AI tools may also help debug logs, traces, and driver behavior. Please share fixes back so the project can keep moving in the electronics engineering community.
+- Firmware is fetched separately by `firmware/stock/fetch.sh`.
+- This repo does not bundle the original vendor firmware blob directly.
+- The patch files in `patches/` are part of the documented working setup in this repository.
 
 ## License
 
-Repository code is BSD-2-Clause unless noted otherwise.
+See [LICENSE](LICENSE).
